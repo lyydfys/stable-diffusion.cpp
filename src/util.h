@@ -88,6 +88,7 @@ std::vector<std::pair<std::string, float>> split_quotation_attention(
 
 sd_progress_cb_t sd_get_progress_callback();
 void* sd_get_progress_callback_data();
+bool sd_should_cancel();
 
 sd_preview_cb_t sd_get_preview_callback();
 void* sd_get_preview_callback_data();

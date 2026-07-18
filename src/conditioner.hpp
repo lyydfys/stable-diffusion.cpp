@@ -1,7 +1,9 @@
 #ifndef __CONDITIONER_HPP__
 #define __CONDITIONER_HPP__
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <optional>
 
@@ -62,6 +64,81 @@ struct SDCondition {
     }
 };
 
+struct ConditioningExecutionSequenceEvidence {
+    std::vector<int32_t> token_ids;
+    std::vector<float> token_weights;
+    bool weights_applied = false;
+    bool counts_toward_token_totals = true;
+};
+
+struct ConditioningExecutionEvidence {
+    std::vector<ConditioningExecutionSequenceEvidence> sequences;
+
+    bool observed() const {
+        return !sequences.empty();
+    }
+
+    bool prompt_weighting_capable() const {
+        return observed() &&
+               std::all_of(sequences.begin(),
+                           sequences.end(),
+                           [](const ConditioningExecutionSequenceEvidence& sequence) {
+                               return sequence.weights_applied;
+                           });
+    }
+};
+
+static inline void record_conditioning_execution_sequence(
+    ConditioningExecutionEvidence* evidence,
+    const std::vector<int>& tokens,
+    const std::vector<float>& weights,
+    bool weights_applied,
+    bool counts_toward_token_totals = true) {
+    if (evidence == nullptr || tokens.empty() || tokens.size() != weights.size()) {
+        return;
+    }
+    ConditioningExecutionSequenceEvidence sequence;
+    sequence.token_ids.assign(tokens.begin(), tokens.end());
+    sequence.token_weights = weights;
+    sequence.weights_applied = weights_applied;
+    sequence.counts_toward_token_totals = counts_toward_token_totals;
+    evidence->sequences.push_back(std::move(sequence));
+}
+
+static inline void record_conditioning_execution_sequences(
+    ConditioningExecutionEvidence* evidence,
+    const std::vector<std::pair<std::vector<int>, std::vector<float>>>& sequences,
+    bool weights_applied) {
+    size_t counted_sequence = sequences.size();
+    bool counted_sequence_has_non_unity_weights = false;
+    for (size_t index = 0; index < sequences.size(); ++index) {
+        const auto& tokens = sequences[index].first;
+        const auto& weights = sequences[index].second;
+        if (tokens.empty() || tokens.size() != weights.size()) {
+            continue;
+        }
+        const bool has_non_unity_weights = std::any_of(
+            weights.begin(),
+            weights.end(),
+            [](float weight) { return weight != 1.0f; });
+        if (counted_sequence == sequences.size() ||
+            (has_non_unity_weights && !counted_sequence_has_non_unity_weights) ||
+            (has_non_unity_weights == counted_sequence_has_non_unity_weights &&
+             tokens.size() > sequences[counted_sequence].first.size())) {
+            counted_sequence = index;
+            counted_sequence_has_non_unity_weights = has_non_unity_weights;
+        }
+    }
+    for (size_t index = 0; index < sequences.size(); ++index) {
+        const auto& sequence = sequences[index];
+        record_conditioning_execution_sequence(evidence,
+                                               sequence.first,
+                                               sequence.second,
+                                               weights_applied,
+                                               index == counted_sequence);
+    }
+}
+
 static inline sd::Tensor<float> apply_token_weights(sd::Tensor<float> hidden_states,
                                                     const std::vector<float>& weights) {
     if (hidden_states.empty()) {
@@ -105,6 +182,7 @@ struct ConditionerParams {
     bool zero_out_masked                             = false;
     int num_input_imgs                               = 0;        // for photomaker
     const std::vector<sd::Tensor<float>>* ref_images = nullptr;  // for qwen image edit
+    ConditioningExecutionEvidence* execution_evidence = nullptr;
 };
 
 struct Conditioner {
@@ -506,7 +584,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                                              int clip_skip,
                                              int width,
                                              int height,
-                                             bool zero_out_masked = false) {
+                                             bool zero_out_masked = false,
+                                             ConditioningExecutionEvidence* execution_evidence = nullptr) {
         int64_t t0 = ggml_time_ms();
         sd::Tensor<float> hidden_states;  // [n_token, hidden_size] or [n_token, hidden_size + hidden_size2]
         sd::Tensor<float> pooled;
@@ -620,6 +699,24 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         if (!vec.empty()) {
             result.c_vector = std::move(vec);
         }
+        record_conditioning_execution_sequence(execution_evidence, tokens, weights, true, true);
+        if (sd_version_is_sdxl(version)) {
+            std::vector<int> secondary_tokens = tokens;
+            for (size_t offset = 0; offset < secondary_tokens.size(); offset += chunk_len) {
+                auto chunk_begin = secondary_tokens.begin() + offset;
+                auto chunk_end = secondary_tokens.begin() +
+                                 std::min(secondary_tokens.size(), offset + chunk_len);
+                auto eos = std::find(chunk_begin, chunk_end, tokenizer.EOS_TOKEN_ID);
+                if (eos != chunk_end) {
+                    std::fill(std::next(eos), chunk_end, 0);
+                }
+            }
+            record_conditioning_execution_sequence(execution_evidence,
+                                                   secondary_tokens,
+                                                   weights,
+                                                   true,
+                                                   false);
+        }
         return result;
     }
 
@@ -651,7 +748,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                                                  conditioner_params.clip_skip,
                                                  conditioner_params.width,
                                                  conditioner_params.height,
-                                                 conditioner_params.zero_out_masked);
+                                                 conditioner_params.zero_out_masked,
+                                                 conditioner_params.execution_evidence);
         return std::make_tuple(cond, clsm);
     }
 
@@ -677,7 +775,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                                             conditioner_params.clip_skip,
                                             conditioner_params.width,
                                             conditioner_params.height,
-                                            conditioner_params.zero_out_masked);
+                                            conditioner_params.zero_out_masked,
+                                            conditioner_params.execution_evidence);
     }
 };
 
@@ -944,7 +1043,8 @@ struct SD3CLIPEmbedder : public Conditioner {
     SDCondition get_learned_condition_common(int n_threads,
                                              std::vector<std::pair<std::vector<int>, std::vector<float>>> token_and_weights,
                                              int clip_skip,
-                                             bool zero_out_masked = false) {
+                                             bool zero_out_masked = false,
+                                             ConditioningExecutionEvidence* execution_evidence = nullptr) {
         auto& clip_l_tokens  = token_and_weights[0].first;
         auto& clip_l_weights = token_and_weights[0].second;
         auto& clip_g_tokens  = token_and_weights[1].first;
@@ -1098,6 +1198,7 @@ struct SD3CLIPEmbedder : public Conditioner {
         SDCondition result;
         result.c_crossattn = std::move(hidden_states);
         result.c_vector    = std::move(pooled);
+        record_conditioning_execution_sequences(execution_evidence, token_and_weights, true);
         return result;
     }
 
@@ -1107,7 +1208,8 @@ struct SD3CLIPEmbedder : public Conditioner {
         return get_learned_condition_common(n_threads,
                                             tokens_and_weights,
                                             conditioner_params.clip_skip,
-                                            conditioner_params.zero_out_masked);
+                                            conditioner_params.zero_out_masked,
+                                            conditioner_params.execution_evidence);
     }
 };
 
@@ -1279,7 +1381,8 @@ struct FluxCLIPEmbedder : public Conditioner {
     SDCondition get_learned_condition_common(int n_threads,
                                              std::vector<std::pair<std::vector<int>, std::vector<float>>> token_and_weights,
                                              int clip_skip,
-                                             bool zero_out_masked = false) {
+                                             bool zero_out_masked = false,
+                                             ConditioningExecutionEvidence* execution_evidence = nullptr) {
         auto& clip_l_tokens  = token_and_weights[0].first;
         auto& clip_l_weights = token_and_weights[0].second;
         auto& t5_tokens      = token_and_weights[1].first;
@@ -1356,6 +1459,7 @@ struct FluxCLIPEmbedder : public Conditioner {
         SDCondition result;
         result.c_crossattn = std::move(hidden_states);
         result.c_vector    = std::move(pooled);
+        record_conditioning_execution_sequences(execution_evidence, token_and_weights, true);
         return result;
     }
 
@@ -1365,7 +1469,8 @@ struct FluxCLIPEmbedder : public Conditioner {
         return get_learned_condition_common(n_threads,
                                             tokens_and_weights,
                                             conditioner_params.clip_skip,
-                                            conditioner_params.zero_out_masked);
+                                            conditioner_params.zero_out_masked,
+                                            conditioner_params.execution_evidence);
     }
 };
 
@@ -1505,7 +1610,8 @@ struct T5CLIPEmbedder : public Conditioner {
     SDCondition get_learned_condition_common(int n_threads,
                                              std::tuple<std::vector<int>, std::vector<float>, std::vector<float>> token_and_weights,
                                              int clip_skip,
-                                             bool zero_out_masked = false) {
+                                             bool zero_out_masked = false,
+                                             ConditioningExecutionEvidence* execution_evidence = nullptr) {
         if (!t5) {
             SDCondition result;
             result.c_crossattn = sd::Tensor<float>::zeros({4096, 256});
@@ -1564,6 +1670,10 @@ struct T5CLIPEmbedder : public Conditioner {
         SDCondition result;
         result.c_crossattn = std::move(hidden_states);
         result.c_vector    = std::move(t5_attn_mask);
+        record_conditioning_execution_sequence(execution_evidence,
+                                               t5_tokens,
+                                               t5_weights,
+                                               true);
         return result;
     }
 
@@ -1573,7 +1683,8 @@ struct T5CLIPEmbedder : public Conditioner {
         return get_learned_condition_common(n_threads,
                                             tokens_and_weights,
                                             conditioner_params.clip_skip,
-                                            conditioner_params.zero_out_masked);
+                                            conditioner_params.zero_out_masked,
+                                            conditioner_params.execution_evidence);
     }
 };
 
@@ -1695,6 +1806,10 @@ struct AnimaConditioner : public Conditioner {
         result.c_crossattn  = std::move(hidden_states);
         result.c_t5_ids     = std::move(t5_ids_tensor);
         result.c_t5_weights = std::move(t5_weight_tensor);
+        record_conditioning_execution_sequences(
+            conditioner_params.execution_evidence,
+            {{qwen_tokens, qwen_weights}, {t5_tokens, t5_weights}},
+            true);
         return result;
     }
 };
@@ -1841,7 +1956,8 @@ struct LLMEmbedder : public Conditioner {
                                     const std::set<int>& out_layers,
                                     int prompt_template_encode_start_idx,
                                     bool spell_quotes = false,
-                                    int max_length    = 100000000) {
+                                    int max_length    = 100000000,
+                                    ConditioningExecutionEvidence* execution_evidence = nullptr) {
         auto tokens_weights_mask = tokenize(prompt, prompt_attn_range, min_length, max_length, spell_quotes);
         auto& tokens             = std::get<0>(tokens_weights_mask);
         auto& weights            = std::get<1>(tokens_weights_mask);
@@ -1873,6 +1989,7 @@ struct LLMEmbedder : public Conditioner {
                                           out_layers);
         GGML_ASSERT(!hidden_states.empty());
         hidden_states = apply_token_weights(std::move(hidden_states), weights);
+        record_conditioning_execution_sequence(execution_evidence, tokens, weights, true);
         GGML_ASSERT(hidden_states.shape()[1] > prompt_template_encode_start_idx);
 
         int64_t zero_pad_len = 0;
@@ -2162,7 +2279,8 @@ struct LLMEmbedder : public Conditioner {
                                                out_layers,
                                                0,
                                                false,
-                                               max_length);
+                                               max_length,
+                                               conditioner_params.execution_evidence);
             GGML_ASSERT(!hidden_states.empty());
 
             if (hidden_states.shape()[1] > pixeldit_max_length) {
@@ -2193,7 +2311,8 @@ struct LLMEmbedder : public Conditioner {
                                            out_layers,
                                            prompt_template_encode_start_idx,
                                            spell_quotes,
-                                           max_length);
+                                           max_length,
+                                           conditioner_params.execution_evidence);
         std::vector<sd::Tensor<float>> extra_hidden_states_vec;
         for (int i = 0; i < extra_prompts.size(); i++) {
             auto extra_hidden_states = encode_prompt(n_threads,
@@ -2205,7 +2324,8 @@ struct LLMEmbedder : public Conditioner {
                                                      out_layers,
                                                      prompt_template_encode_start_idx,
                                                      spell_quotes,
-                                                     max_length);
+                                                     max_length,
+                                                     conditioner_params.execution_evidence);
             extra_hidden_states_vec.push_back(std::move(extra_hidden_states));
         }
 

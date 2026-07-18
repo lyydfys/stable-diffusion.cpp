@@ -399,17 +399,106 @@ typedef struct {
 
 typedef struct sd_ctx_t sd_ctx_t;
 
+enum {
+    SD_IMAGE_EXECUTION_EVIDENCE_VERSION = 4,
+};
+
+typedef struct {
+    uint32_t version;
+    uint32_t positive_conditioning_observed;
+    uint32_t negative_conditioning_observed;
+    uint32_t positive_prompt_weighting_capable;
+    uint32_t negative_prompt_weighting_capable;
+    uint32_t prompt_weighting_applied;
+    uint32_t generation_completed;
+    uint32_t flow_shift_applied;
+    uint32_t dynamic_flow_shift;
+    uint32_t distilled_guidance_applied;
+    float effective_flow_shift;
+    float effective_distilled_guidance;
+    uint64_t positive_conditioning_token_count;
+    uint64_t negative_conditioning_token_count;
+    uint64_t positive_non_unity_weight_count;
+    uint64_t negative_non_unity_weight_count;
+    uint64_t completed_sampling_step_count;
+    uint64_t sampling_pass_count;
+    uint64_t diffusion_model_compute_count;
+    uint64_t positive_diffusion_model_compute_count;
+    uint64_t negative_diffusion_model_compute_count;
+    uint64_t auxiliary_diffusion_model_compute_count;
+    uint64_t conditioning_artifact_byte_count;
+    uint32_t lora_requested_count;
+    uint32_t lora_loaded_count;
+    uint32_t lora_applied_count;
+    uint64_t lora_applied_tensor_count;
+    uint64_t control_net_compute_attempt_count;
+    uint64_t control_net_compute_success_count;
+    uint64_t positive_control_net_compute_attempt_count;
+    uint64_t positive_control_net_compute_success_count;
+    uint64_t negative_control_net_compute_attempt_count;
+    uint64_t negative_control_net_compute_success_count;
+    uint64_t control_net_residual_consumption_count;
+    uint64_t positive_control_net_residual_consumption_count;
+    uint64_t negative_control_net_residual_consumption_count;
+    uint64_t auxiliary_control_net_residual_consumption_count;
+    uint64_t vae_encode_tiling_invocation_count;
+    uint64_t vae_encode_tiling_success_count;
+    uint64_t vae_decode_tiling_invocation_count;
+    uint64_t vae_decode_tiling_success_count;
+    uint64_t vae_encode_planned_tile_count;
+    uint64_t vae_decode_planned_tile_count;
+    uint64_t vae_encode_tile_compute_attempt_count;
+    uint64_t vae_encode_tile_compute_success_count;
+    uint64_t vae_decode_tile_compute_attempt_count;
+    uint64_t vae_decode_tile_compute_success_count;
+    uint32_t vae_encode_tile_size_x;
+    uint32_t vae_encode_tile_size_y;
+    uint32_t vae_decode_tile_size_x;
+    uint32_t vae_decode_tile_size_y;
+    float vae_encode_tile_overlap_x;
+    float vae_encode_tile_overlap_y;
+    float vae_decode_tile_overlap_x;
+    float vae_decode_tile_overlap_y;
+} sd_image_execution_evidence_t;
+
+#ifdef __cplusplus
+static_assert(SD_IMAGE_EXECUTION_EVIDENCE_VERSION == 4u,
+              "image execution evidence ABI version changed");
+static_assert(sizeof(sd_image_execution_evidence_t) == 352u,
+              "image execution evidence ABI size changed");
+static_assert(offsetof(sd_image_execution_evidence_t, version) == 0u,
+              "image execution evidence version offset changed");
+static_assert(offsetof(sd_image_execution_evidence_t, control_net_compute_attempt_count) == 160u,
+              "image execution evidence ControlNet offset changed");
+static_assert(offsetof(sd_image_execution_evidence_t, auxiliary_control_net_residual_consumption_count) == 232u,
+              "image execution evidence ControlNet tail offset changed");
+static_assert(offsetof(sd_image_execution_evidence_t, vae_encode_tiling_invocation_count) == 240u,
+              "image execution evidence VAE offset changed");
+static_assert(offsetof(sd_image_execution_evidence_t, vae_decode_tile_overlap_y) == 348u,
+              "image execution evidence VAE tail offset changed");
+#endif
+
 typedef void (*sd_log_cb_t)(enum sd_log_level_t level, const char* text, void* data);
 typedef void (*sd_progress_cb_t)(int step, int steps, float time, void* data);
+typedef bool (*sd_cancel_cb_t)(void* data);
 typedef void (*sd_preview_cb_t)(int step, int frame_count, sd_image_t* frames, bool is_noisy, void* data);
 
 SD_API void sd_set_log_callback(sd_log_cb_t sd_log_cb, void* data);
 SD_API void sd_set_progress_callback(sd_progress_cb_t cb, void* data);
+SD_API void sd_set_cancel_callback(sd_cancel_cb_t cb, void* data);
 SD_API void sd_set_preview_callback(sd_preview_cb_t cb, enum preview_t mode, int interval, bool denoised, bool noisy, void* data);
 SD_API int32_t sd_get_num_physical_cores();
 SD_API const char* sd_get_system_info();
 SD_API bool sd_ctx_supports_image_generation(const sd_ctx_t* sd_ctx);
 SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_uses_flow_shift(const sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_uses_dynamic_flow_shift(const sd_ctx_t* sd_ctx);
+SD_API bool sd_ctx_uses_distilled_guidance(const sd_ctx_t* sd_ctx);
+SD_API bool sd_get_last_image_execution_evidence(const sd_ctx_t* sd_ctx,
+                                                  sd_image_execution_evidence_t* evidence);
+SD_API bool sd_copy_last_image_conditioning_artifact(const sd_ctx_t* sd_ctx,
+                                                      uint8_t* destination,
+                                                      size_t destination_size);
 
 SD_API const char* sd_type_name(enum sd_type_t type);
 SD_API enum sd_type_t str_to_sd_type(const char* str);
@@ -457,6 +546,36 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
 
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 
+#define SD_UPSCALER_EXECUTION_EVIDENCE_VERSION 1u
+
+typedef struct sd_upscaler_execution_evidence_t {
+    uint32_t version;
+    uint32_t requested_scale;
+    uint32_t native_scale;
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t output_width;
+    uint32_t output_height;
+    uint32_t tiled;
+    uint32_t completed;
+    uint32_t cancelled;
+    uint64_t compute_invocation_count;
+    uint64_t compute_success_count;
+    uint64_t tile_compute_invocation_count;
+    uint64_t tile_compute_success_count;
+} sd_upscaler_execution_evidence_t;
+
+#ifdef __cplusplus
+static_assert(sizeof(sd_upscaler_execution_evidence_t) == 72u,
+              "upscaler execution evidence ABI size changed");
+static_assert(offsetof(sd_upscaler_execution_evidence_t, version) == 0u,
+              "upscaler execution evidence version offset changed");
+static_assert(offsetof(sd_upscaler_execution_evidence_t, compute_invocation_count) == 40u,
+              "upscaler execution evidence compute offset changed");
+static_assert(offsetof(sd_upscaler_execution_evidence_t, tile_compute_success_count) == 64u,
+              "upscaler execution evidence tile offset changed");
+#endif
+
 SD_API upscaler_ctx_t* new_upscaler_ctx(const char* esrgan_path,
                                         bool offload_params_to_cpu,
                                         bool direct,
@@ -471,6 +590,9 @@ SD_API sd_image_t upscale(upscaler_ctx_t* upscaler_ctx,
                           uint32_t upscale_factor);
 
 SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
+SD_API bool sd_get_upscaler_execution_evidence(
+    const upscaler_ctx_t* upscaler_ctx,
+    sd_upscaler_execution_evidence_t* evidence);
 
 SD_API bool convert(const char* input_path,
                     const char* vae_path,

@@ -340,6 +340,8 @@ int32_t sd_get_num_physical_cores() {
 
 static sd_progress_cb_t sd_progress_cb = nullptr;
 void* sd_progress_cb_data              = nullptr;
+static sd_cancel_cb_t sd_cancel_cb = nullptr;
+static void* sd_cancel_cb_data     = nullptr;
 
 static sd_preview_cb_t sd_preview_cb = nullptr;
 static void* sd_preview_cb_data      = nullptr;
@@ -613,6 +615,10 @@ void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
     sd_progress_cb      = cb;
     sd_progress_cb_data = data;
 }
+void sd_set_cancel_callback(sd_cancel_cb_t cb, void* data) {
+    sd_cancel_cb      = cb;
+    sd_cancel_cb_data = data;
+}
 void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode, int interval, bool denoised, bool noisy, void* data) {
     sd_preview_cb       = cb;
     sd_preview_cb_data  = data;
@@ -647,6 +653,9 @@ sd_progress_cb_t sd_get_progress_callback() {
 }
 void* sd_get_progress_callback_data() {
     return sd_progress_cb_data;
+}
+bool sd_should_cancel() {
+    return sd_cancel_cb != nullptr && sd_cancel_cb(sd_cancel_cb_data);
 }
 
 sd_image_t tensor_to_sd_image(const sd::Tensor<float>& tensor, int frame_index) {

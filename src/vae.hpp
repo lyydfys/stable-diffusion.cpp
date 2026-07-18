@@ -8,6 +8,7 @@ struct VAE : public GGMLRunner {
 protected:
     SDVersion version;
     bool scale_input                                      = true;
+    sd_image_execution_evidence_t* image_execution_evidence = nullptr;
     virtual sd::Tensor<float> _compute(const int n_threads,
                                        const sd::Tensor<float>& z,
                                        bool decode_graph) = 0;
@@ -27,6 +28,89 @@ protected:
         }
     }
 
+    void record_tiling_invocation(bool decode_graph,
+                                  int small_width,
+                                  int small_height,
+                                  int tile_size_x,
+                                  int tile_size_y,
+                                  float tile_overlap,
+                                  bool circular_x,
+                                  bool circular_y) {
+        if (image_execution_evidence == nullptr) {
+            return;
+        }
+        int num_tiles_x = 0;
+        int num_tiles_y = 0;
+        float actual_overlap_x = 0.0f;
+        float actual_overlap_y = 0.0f;
+        sd_tiling_calc_tiles(num_tiles_x,
+                             actual_overlap_x,
+                             small_width,
+                             tile_size_x,
+                             tile_overlap,
+                             circular_x);
+        sd_tiling_calc_tiles(num_tiles_y,
+                             actual_overlap_y,
+                             small_height,
+                             tile_size_y,
+                             tile_overlap,
+                             circular_y);
+        const uint64_t planned_tile_count =
+            static_cast<uint64_t>(num_tiles_x) * static_cast<uint64_t>(num_tiles_y);
+        if (decode_graph) {
+            ++image_execution_evidence->vae_decode_tiling_invocation_count;
+            image_execution_evidence->vae_decode_planned_tile_count += planned_tile_count;
+            image_execution_evidence->vae_decode_tile_size_x =
+                static_cast<uint32_t>(tile_size_x);
+            image_execution_evidence->vae_decode_tile_size_y =
+                static_cast<uint32_t>(tile_size_y);
+            image_execution_evidence->vae_decode_tile_overlap_x = actual_overlap_x;
+            image_execution_evidence->vae_decode_tile_overlap_y = actual_overlap_y;
+        } else {
+            ++image_execution_evidence->vae_encode_tiling_invocation_count;
+            image_execution_evidence->vae_encode_planned_tile_count += planned_tile_count;
+            image_execution_evidence->vae_encode_tile_size_x =
+                static_cast<uint32_t>(tile_size_x);
+            image_execution_evidence->vae_encode_tile_size_y =
+                static_cast<uint32_t>(tile_size_y);
+            image_execution_evidence->vae_encode_tile_overlap_x = actual_overlap_x;
+            image_execution_evidence->vae_encode_tile_overlap_y = actual_overlap_y;
+        }
+    }
+
+    void record_tiling_success(bool decode_graph) {
+        if (image_execution_evidence == nullptr) {
+            return;
+        }
+        if (decode_graph) {
+            ++image_execution_evidence->vae_decode_tiling_success_count;
+        } else {
+            ++image_execution_evidence->vae_encode_tiling_success_count;
+        }
+    }
+
+    void record_tile_compute_attempt(bool decode_graph) {
+        if (image_execution_evidence == nullptr) {
+            return;
+        }
+        if (decode_graph) {
+            ++image_execution_evidence->vae_decode_tile_compute_attempt_count;
+        } else {
+            ++image_execution_evidence->vae_encode_tile_compute_attempt_count;
+        }
+    }
+
+    void record_tile_compute_success(bool decode_graph) {
+        if (image_execution_evidence == nullptr) {
+            return;
+        }
+        if (decode_graph) {
+            ++image_execution_evidence->vae_decode_tile_compute_success_count;
+        } else {
+            ++image_execution_evidence->vae_encode_tile_compute_success_count;
+        }
+    }
+
     sd::Tensor<float> tiled_compute(const sd::Tensor<float>& input,
                                     int n_threads,
                                     int output_width,
@@ -39,12 +123,19 @@ protected:
                                     bool circular_y,
                                     bool decode_graph,
                                     const char* error_message,
-                                    bool silent = false) {
+                                    bool silent                    = false,
+                                    bool record_execution_evidence = true) {
         auto on_processing = [&](const sd::Tensor<float>& input_tile) {
+            if (record_execution_evidence) {
+                record_tile_compute_attempt(decode_graph);
+            }
             auto output_tile = _compute(n_threads, input_tile, decode_graph);
             if (output_tile.empty()) {
                 LOG_ERROR("%s", error_message);
                 return sd::Tensor<float>();
+            }
+            if (record_execution_evidence) {
+                record_tile_compute_success(decode_graph);
             }
             return output_tile;
         };
@@ -64,6 +155,10 @@ protected:
 public:
     VAE(SDVersion version, ggml_backend_t backend, ggml_backend_t params_backend)
         : version(version), GGMLRunner(backend, params_backend) {}
+
+    void set_image_execution_evidence(sd_image_execution_evidence_t* evidence) {
+        image_execution_evidence = evidence;
+    }
 
     int get_scale_factor() {
         int scale_factor = 8;
@@ -129,6 +224,14 @@ public:
             float tile_overlap;
             int tile_size_x, tile_size_y;
             get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, W, H, 1.30539f);
+            record_tiling_invocation(false,
+                                     static_cast<int>(W),
+                                     static_cast<int>(H),
+                                     tile_size_x,
+                                     tile_size_y,
+                                     tile_overlap,
+                                     circular_x,
+                                     circular_y);
             LOG_DEBUG("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
             output = tiled_compute(input,
                                    n_threads,
@@ -142,6 +245,9 @@ public:
                                    circular_y,
                                    false,
                                    "vae encode compute failed while processing a tile");
+            if (!output.empty()) {
+                record_tiling_success(false);
+            }
         } else {
             output = _compute(n_threads, input, false);
         }
@@ -163,7 +269,8 @@ public:
                              bool decode_video = false,
                              bool circular_x   = false,
                              bool circular_y   = false,
-                             bool silent       = false) {
+                             bool silent       = false,
+                             bool record_execution_evidence = true) {
         int64_t t0              = ggml_time_ms();
         sd::Tensor<float> input = x;
         sd::Tensor<float> output;
@@ -176,6 +283,16 @@ public:
             float tile_overlap;
             int tile_size_x, tile_size_y;
             get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, input.shape()[0], input.shape()[1]);
+            if (record_execution_evidence) {
+                record_tiling_invocation(true,
+                                         static_cast<int>(input.shape()[0]),
+                                         static_cast<int>(input.shape()[1]),
+                                         tile_size_x,
+                                         tile_size_y,
+                                         tile_overlap,
+                                         circular_x,
+                                         circular_y);
+            }
             if (!silent) {
                 LOG_DEBUG("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
             }
@@ -192,7 +309,11 @@ public:
                 circular_y,
                 true,
                 "vae decode compute failed while processing a tile",
-                silent);
+                silent,
+                record_execution_evidence);
+            if (!output.empty() && record_execution_evidence) {
+                record_tiling_success(true);
+            }
         } else {
             output = _compute(n_threads, input, true);
         }

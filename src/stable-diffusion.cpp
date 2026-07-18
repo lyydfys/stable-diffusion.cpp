@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
+#include <unordered_set>
 
 #include "ggml_extend.hpp"
 #include "ggml_graph_cut.h"
@@ -136,10 +139,274 @@ static float get_cache_reuse_threshold(const sd_cache_params_t& params) {
     return std::max(0.0f, reuse_threshold);
 }
 
+enum class DiffusionExecutionBranch : uint32_t {
+    POSITIVE = 1,
+    NEGATIVE = 2,
+    AUXILIARY = 3,
+};
+
+struct ImageExecutionEvidenceState {
+    static constexpr uint32_t VERSION = SD_IMAGE_EXECUTION_EVIDENCE_VERSION;
+
+    sd_image_execution_evidence_t summary = {};
+    std::vector<uint8_t> conditioning_artifact;
+    bool collecting = false;
+
+    void append_u32(uint32_t value) {
+        for (uint32_t shift = 0; shift < 32; shift += 8) {
+            conditioning_artifact.push_back(static_cast<uint8_t>((value >> shift) & 0xffu));
+        }
+    }
+
+    void append_u64(uint64_t value) {
+        for (uint32_t shift = 0; shift < 64; shift += 8) {
+            conditioning_artifact.push_back(static_cast<uint8_t>((value >> shift) & 0xffu));
+        }
+    }
+
+    void reset() {
+        summary = {};
+        summary.version = VERSION;
+        conditioning_artifact.clear();
+        conditioning_artifact.insert(conditioning_artifact.end(), {'I', 'C', 'E', 'V'});
+        append_u32(VERSION);
+        summary.conditioning_artifact_byte_count = conditioning_artifact.size();
+        collecting = true;
+    }
+
+    void stop() {
+        collecting = false;
+    }
+
+    void record_conditioning(DiffusionExecutionBranch branch,
+                             const ConditioningExecutionEvidence& evidence) {
+        if (!collecting || branch == DiffusionExecutionBranch::AUXILIARY) {
+            return;
+        }
+
+        const bool negative = branch == DiffusionExecutionBranch::NEGATIVE;
+        uint32_t* observed = negative
+                                 ? &summary.negative_conditioning_observed
+                                 : &summary.positive_conditioning_observed;
+        uint32_t* weighting_capable = negative
+                                          ? &summary.negative_prompt_weighting_capable
+                                          : &summary.positive_prompt_weighting_capable;
+        uint64_t* token_count = negative
+                                    ? &summary.negative_conditioning_token_count
+                                    : &summary.positive_conditioning_token_count;
+        uint64_t* non_unity_count = negative
+                                        ? &summary.negative_non_unity_weight_count
+                                        : &summary.positive_non_unity_weight_count;
+
+        *observed = evidence.observed() ? 1u : 0u;
+        *weighting_capable = evidence.prompt_weighting_capable() ? 1u : 0u;
+        *token_count = 0;
+        *non_unity_count = 0;
+
+        append_u32(static_cast<uint32_t>(branch));
+        append_u32(*observed);
+        append_u64(static_cast<uint64_t>(evidence.sequences.size()));
+        for (const auto& sequence : evidence.sequences) {
+            append_u32(sequence.weights_applied ? 1u : 0u);
+            append_u32(sequence.counts_toward_token_totals ? 1u : 0u);
+            append_u64(static_cast<uint64_t>(sequence.token_ids.size()));
+            if (sequence.token_ids.size() != sequence.token_weights.size()) {
+                *observed = 0u;
+                continue;
+            }
+            if (sequence.counts_toward_token_totals) {
+                *token_count += static_cast<uint64_t>(sequence.token_ids.size());
+            }
+            for (size_t index = 0; index < sequence.token_ids.size(); ++index) {
+                append_u32(static_cast<uint32_t>(sequence.token_ids[index]));
+                uint32_t weight_bits = 0;
+                static_assert(sizeof(weight_bits) == sizeof(sequence.token_weights[index]),
+                              "conditioning weight must be binary32");
+                std::memcpy(&weight_bits,
+                            &sequence.token_weights[index],
+                            sizeof(weight_bits));
+                append_u32(weight_bits);
+                if (sequence.counts_toward_token_totals &&
+                    sequence.weights_applied &&
+                    sequence.token_weights[index] != 1.0f) {
+                    ++(*non_unity_count);
+                }
+            }
+        }
+        summary.prompt_weighting_applied =
+            summary.positive_non_unity_weight_count > 0 ||
+                    summary.negative_non_unity_weight_count > 0
+                ? 1u
+                : 0u;
+        summary.conditioning_artifact_byte_count = conditioning_artifact.size();
+    }
+
+    void record_sampling_pass() {
+        if (collecting) {
+            ++summary.sampling_pass_count;
+        }
+    }
+
+    void record_completed_sampling_step() {
+        if (collecting) {
+            ++summary.completed_sampling_step_count;
+        }
+    }
+
+    void record_diffusion_compute(DiffusionExecutionBranch branch) {
+        if (!collecting) {
+            return;
+        }
+        ++summary.diffusion_model_compute_count;
+        switch (branch) {
+            case DiffusionExecutionBranch::POSITIVE:
+                ++summary.positive_diffusion_model_compute_count;
+                break;
+            case DiffusionExecutionBranch::NEGATIVE:
+                ++summary.negative_diffusion_model_compute_count;
+                break;
+            case DiffusionExecutionBranch::AUXILIARY:
+                ++summary.auxiliary_diffusion_model_compute_count;
+                break;
+        }
+    }
+
+    void record_control_net_compute_attempt(DiffusionExecutionBranch branch) {
+        if (!collecting) {
+            return;
+        }
+        ++summary.control_net_compute_attempt_count;
+        switch (branch) {
+            case DiffusionExecutionBranch::POSITIVE:
+                ++summary.positive_control_net_compute_attempt_count;
+                break;
+            case DiffusionExecutionBranch::NEGATIVE:
+                ++summary.negative_control_net_compute_attempt_count;
+                break;
+            case DiffusionExecutionBranch::AUXILIARY:
+                break;
+        }
+    }
+
+    void record_control_net_compute_success(DiffusionExecutionBranch branch) {
+        if (!collecting) {
+            return;
+        }
+        ++summary.control_net_compute_success_count;
+        switch (branch) {
+            case DiffusionExecutionBranch::POSITIVE:
+                ++summary.positive_control_net_compute_success_count;
+                break;
+            case DiffusionExecutionBranch::NEGATIVE:
+                ++summary.negative_control_net_compute_success_count;
+                break;
+            case DiffusionExecutionBranch::AUXILIARY:
+                break;
+        }
+    }
+
+    void record_control_net_residual_consumption(DiffusionExecutionBranch branch) {
+        if (!collecting) {
+            return;
+        }
+        ++summary.control_net_residual_consumption_count;
+        switch (branch) {
+            case DiffusionExecutionBranch::POSITIVE:
+                ++summary.positive_control_net_residual_consumption_count;
+                break;
+            case DiffusionExecutionBranch::NEGATIVE:
+                ++summary.negative_control_net_residual_consumption_count;
+                break;
+            case DiffusionExecutionBranch::AUXILIARY:
+                ++summary.auxiliary_control_net_residual_consumption_count;
+                break;
+        }
+    }
+
+    void record_lora_requested(uint32_t count) {
+        if (collecting) {
+            summary.lora_requested_count = count;
+            summary.lora_loaded_count = 0u;
+            summary.lora_applied_count = 0u;
+            summary.lora_applied_tensor_count = 0u;
+        }
+    }
+
+    void record_lora_loaded(uint32_t count) {
+        if (collecting) {
+            summary.lora_loaded_count = count;
+        }
+    }
+
+    void record_lora_applied(uint32_t count, uint64_t tensor_count) {
+        if (collecting) {
+            summary.lora_applied_count = count;
+            summary.lora_applied_tensor_count = tensor_count;
+        }
+    }
+
+    void mark_generation_completed(bool flow_shift_applied,
+                                   bool dynamic_flow_shift,
+                                   float effective_flow_shift,
+                                   bool distilled_guidance_applied,
+                                   float effective_distilled_guidance) {
+        if (collecting) {
+            summary.generation_completed = 1u;
+            summary.flow_shift_applied = flow_shift_applied ? 1u : 0u;
+            summary.dynamic_flow_shift = dynamic_flow_shift ? 1u : 0u;
+            summary.distilled_guidance_applied = distilled_guidance_applied ? 1u : 0u;
+            summary.effective_flow_shift = flow_shift_applied ? effective_flow_shift : 0.0f;
+            summary.effective_distilled_guidance = distilled_guidance_applied
+                                                       ? effective_distilled_guidance
+                                                       : 0.0f;
+        }
+    }
+};
+
+struct ImageExecutionEvidenceScope {
+    explicit ImageExecutionEvidenceScope(ImageExecutionEvidenceState& evidence)
+        : evidence(evidence) {
+        evidence.reset();
+    }
+
+    ~ImageExecutionEvidenceScope() {
+        evidence.stop();
+    }
+
+    ImageExecutionEvidenceState& evidence;
+};
+
+struct VaeImageExecutionEvidenceScope {
+    VaeImageExecutionEvidenceScope(const std::shared_ptr<VAE>& first_stage_model,
+                                   const std::shared_ptr<VAE>& preview_vae,
+                                   sd_image_execution_evidence_t* evidence)
+        : first_stage_model(first_stage_model), preview_vae(preview_vae) {
+        if (this->first_stage_model != nullptr) {
+            this->first_stage_model->set_image_execution_evidence(evidence);
+        }
+        if (this->preview_vae != nullptr) {
+            this->preview_vae->set_image_execution_evidence(evidence);
+        }
+    }
+
+    ~VaeImageExecutionEvidenceScope() {
+        if (first_stage_model != nullptr) {
+            first_stage_model->set_image_execution_evidence(nullptr);
+        }
+        if (preview_vae != nullptr) {
+            preview_vae->set_image_execution_evidence(nullptr);
+        }
+    }
+
+    std::shared_ptr<VAE> first_stage_model;
+    std::shared_ptr<VAE> preview_vae;
+};
+
 /*=============================================== StableDiffusionGGML ================================================*/
 
 class StableDiffusionGGML {
 public:
+    ImageExecutionEvidenceState image_execution_evidence;
     std::vector<MmapTensorStore> mmap_tensor_store;
     SDBackendManager backend_manager;
 
@@ -155,6 +422,7 @@ public:
     std::shared_ptr<RNG> sampler_rng = nullptr;
     int n_threads                    = -1;
     float default_flow_shift         = INFINITY;
+    bool distilled_guidance_input_enabled = false;
 
     std::shared_ptr<Conditioner> cond_stage_model;
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
@@ -170,6 +438,7 @@ public:
     std::vector<std::shared_ptr<LoraModel>> cond_stage_lora_models;
     std::vector<std::shared_ptr<LoraModel>> diffusion_lora_models;
     std::vector<std::shared_ptr<LoraModel>> first_stage_lora_models;
+    std::unordered_set<std::string> requested_lora_ids;
     bool apply_lora_immediately = false;
 
     std::string taesd_path;
@@ -1141,6 +1410,19 @@ public:
                 params_memory_location(pmid_params_mem_size, SDBackendModule::PHOTOMAKER));
         }
 
+        distilled_guidance_input_enabled = false;
+        if (sd_version_is_flux(version) ||
+            sd_version_is_flux2(version) ||
+            sd_version_is_longcat(version)) {
+            for (const auto& [name, tensor_storage] : tensor_storage_map) {
+                (void)tensor_storage;
+                if (name.find("guidance_in.in_layer.weight") != std::string::npos) {
+                    distilled_guidance_input_enabled = true;
+                    break;
+                }
+            }
+        }
+
         // init denoiser
         {
             prediction_t pred_type = sd_ctx_params->prediction;
@@ -1493,13 +1775,33 @@ public:
                 first_stage_model->set_weight_adapter(multi_lora_adapter);
             }
         }
+        std::unordered_set<std::string> loaded_ids;
+        const auto collect_loaded = [&](const std::vector<std::shared_ptr<LoraModel>>& models) {
+            for (const auto& model : models) {
+                if (model && !model->lora_tensors.empty()) loaded_ids.insert(model->lora_id);
+            }
+        };
+        collect_loaded(cond_stage_lora_models);
+        collect_loaded(diffusion_lora_models);
+        collect_loaded(first_stage_lora_models);
+        image_execution_evidence.record_lora_loaded(static_cast<uint32_t>(loaded_ids.size()));
     }
 
     void lora_stat() {
+        std::unordered_set<std::string> applied_ids;
+        uint64_t applied_tensor_count = 0u;
+        const auto collect_applied = [&](const std::shared_ptr<LoraModel>& lora_model) {
+            if (lora_model && !lora_model->applied_lora_tensors.empty()) {
+                applied_ids.insert(lora_model->lora_id);
+                applied_tensor_count +=
+                    static_cast<uint64_t>(lora_model->applied_lora_tensors.size());
+            }
+        };
         if (!cond_stage_lora_models.empty()) {
             LOG_INFO("cond_stage_lora_models:");
             for (auto& lora_model : cond_stage_lora_models) {
                 lora_model->stat();
+                collect_applied(lora_model);
             }
         }
 
@@ -1507,6 +1809,7 @@ public:
             LOG_INFO("diffusion_lora_models:");
             for (auto& lora_model : diffusion_lora_models) {
                 lora_model->stat();
+                collect_applied(lora_model);
             }
         }
 
@@ -1514,20 +1817,28 @@ public:
             LOG_INFO("first_stage_lora_models:");
             for (auto& lora_model : first_stage_lora_models) {
                 lora_model->stat();
+                collect_applied(lora_model);
             }
         }
+        image_execution_evidence.record_lora_applied(
+            static_cast<uint32_t>(applied_ids.size()),
+            applied_tensor_count);
     }
 
     void apply_loras(const sd_lora_t* loras, uint32_t lora_count) {
         std::unordered_map<std::string, float> lora_f2m;
+        requested_lora_ids.clear();
         for (uint32_t i = 0; i < lora_count; i++) {
             std::string lora_id = SAFE_STR(loras[i].path);
             if (loras[i].is_high_noise) {
                 lora_id = "|high_noise|" + lora_id;
             }
             lora_f2m[lora_id] = loras[i].multiplier;
+            requested_lora_ids.insert(lora_id);
             LOG_DEBUG("lora %s:%.2f", lora_id.c_str(), loras[i].multiplier);
         }
+        image_execution_evidence.record_lora_requested(
+            static_cast<uint32_t>(requested_lora_ids.size()));
         int64_t t0 = ggml_time_ms();
         if (apply_lora_immediately) {
             apply_loras_immediately(lora_f2m);
@@ -1786,14 +2097,29 @@ public:
         if (preview_mode == PREVIEW_VAE || preview_mode == PREVIEW_TAE) {
             sd::Tensor<float> vae_latents;
             sd::Tensor<float> decoded;
+            const bool record_preview_vae_execution = false;
             if (preview_vae) {
                 preview_vae->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
                 vae_latents = preview_vae->diffusion_to_vae_latents(_latents);
-                decoded     = preview_vae->decode(n_threads, vae_latents, vae_tiling_params, is_video, circular_x, circular_y, true);
+                decoded     = preview_vae->decode(n_threads,
+                                                  vae_latents,
+                                                  vae_tiling_params,
+                                                  is_video,
+                                                  circular_x,
+                                                  circular_y,
+                                                  true,
+                                                  record_preview_vae_execution);
             } else {
                 first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
                 vae_latents = first_stage_model->diffusion_to_vae_latents(_latents);
-                decoded     = first_stage_model->decode(n_threads, vae_latents, vae_tiling_params, is_video, circular_x, circular_y, true);
+                decoded     = first_stage_model->decode(n_threads,
+                                                        vae_latents,
+                                                        vae_tiling_params,
+                                                        is_video,
+                                                        circular_x,
+                                                        circular_y,
+                                                        true,
+                                                        record_preview_vae_execution);
             }
             if (decoded.empty()) {
                 LOG_ERROR("preview decode failed at step %d", step);
@@ -1878,6 +2204,7 @@ public:
     }
 
     void report_sample_progress(int step, size_t total_steps, int64_t t0) {
+        image_execution_evidence.record_completed_sampling_step();
         int64_t t1 = ggml_time_us();
         if (step > 0 || step == -(int)total_steps) {
             int showstep = std::abs(step);
@@ -1885,15 +2212,22 @@ public:
         }
     }
 
-    void compute_sample_controls(const sd::Tensor<float>& control_image,
+    bool compute_sample_controls(const sd::Tensor<float>& control_image,
                                  const sd::Tensor<float>& noised_input,
                                  const sd::Tensor<float>& timesteps_tensor,
                                  const SDCondition& condition,
+                                 DiffusionExecutionBranch execution_branch,
                                  std::vector<sd::Tensor<float>>* controls) {
         GGML_ASSERT(controls != nullptr);
         controls->clear();
-        if (control_image.empty() || control_net == nullptr) {
-            return;
+        if (control_image.empty()) {
+            return true;
+        }
+
+        image_execution_evidence.record_control_net_compute_attempt(execution_branch);
+        if (control_net == nullptr) {
+            LOG_ERROR("control image was provided without a loaded ControlNet");
+            return false;
         }
 
         auto control_result = control_net->compute(n_threads,
@@ -1902,12 +2236,14 @@ public:
                                                    timesteps_tensor,
                                                    condition.c_crossattn,
                                                    condition.c_vector);
-        if (!control_result.has_value()) {
+        if (!control_result.has_value() || control_result->empty()) {
             LOG_ERROR("controlnet compute failed");
-            return;
+            return false;
         }
 
         *controls = std::move(*control_result);
+        image_execution_evidence.record_control_net_compute_success(execution_branch);
+        return true;
     }
 
     sd::Tensor<float> sample(const std::shared_ptr<DiffusionModelRunner>& work_diffusion_model,
@@ -1958,6 +2294,7 @@ public:
         }
 
         size_t steps       = sigmas.size() - 1;
+        image_execution_evidence.record_sampling_pass();
         bool has_skiplayer = (slg_scale != 0.0f || slg_uncond) && !skip_layers.empty();
         if (has_skiplayer && !sd_version_is_dit(version)) {
             has_skiplayer = false;
@@ -1990,6 +2327,10 @@ public:
         SamplePreviewContext preview = prepare_sample_preview_context();
 
         auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
+            if (sd_should_cancel()) {
+                LOG_WARN("sampling cancelled before step %d", step);
+                return {};
+            }
             if (step == 1 || step == -1) {
                 pretty_progress(0, (int)steps, 0);
             }
@@ -2053,13 +2394,17 @@ public:
             step_guidance_input.schedule_size = sigmas.size();
             bool is_skiplayer_step            = skip_layer_guidance.is_enabled_for_step(step_guidance_input);
 
-            compute_sample_controls(control_image,
-                                    noised_input,
-                                    timesteps_tensor,
-                                    cond,
-                                    &controls);
+            if (!compute_sample_controls(control_image,
+                                         noised_input,
+                                         timesteps_tensor,
+                                         cond,
+                                         DiffusionExecutionBranch::POSITIVE,
+                                         &controls)) {
+                return {};
+            }
 
             auto run_condition = [&](const SDCondition& condition,
+                                     DiffusionExecutionBranch execution_branch,
                                      const sd::Tensor<float>* c_concat_override = nullptr,
                                      const std::vector<int>* local_skip_layers  = nullptr) -> sd::Tensor<float> {
                 diffusion_params.context     = condition.c_crossattn.empty() ? nullptr : &condition.c_crossattn;
@@ -2103,7 +2448,24 @@ public:
                     return std::move(cached_output);
                 }
 
+                if (sd_should_cancel()) {
+                    LOG_WARN("sampling cancelled before diffusion compute at step %d", step);
+                    return sd::Tensor<float>();
+                }
+                const bool control_residuals_wired =
+                    sd_version_is_unet(version) && !controls.empty();
                 auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);
+                if (!output_opt.empty()) {
+                    image_execution_evidence.record_diffusion_compute(execution_branch);
+                    if (control_residuals_wired) {
+                        image_execution_evidence.record_control_net_residual_consumption(
+                            execution_branch);
+                    }
+                }
+                if (sd_should_cancel()) {
+                    LOG_WARN("sampling cancelled after diffusion compute at step %d", step);
+                    return sd::Tensor<float>();
+                }
                 if (output_opt.empty()) {
                     LOG_ERROR("diffusion model compute failed");
                     return sd::Tensor<float>();
@@ -2114,13 +2476,14 @@ public:
             };
 
             if (start_merge_step == -1 || step <= start_merge_step) {
-                cond_out = run_condition(cond);
+                cond_out = run_condition(cond, DiffusionExecutionBranch::POSITIVE);
                 if (cond_out.empty()) {
                     return {};
                 }
             } else {
                 GGML_ASSERT(!id_cond.empty());
                 cond_out = run_condition(id_cond,
+                                         DiffusionExecutionBranch::POSITIVE,
                                          cond.c_concat.empty() ? nullptr : &cond.c_concat);
                 if (cond_out.empty()) {
                     return {};
@@ -2129,24 +2492,31 @@ public:
 
             if (!uncond.empty()) {
                 if (!step_cache.is_step_skipped()) {
-                    compute_sample_controls(control_image,
-                                            noised_input,
-                                            timesteps_tensor,
-                                            uncond,
-                                            &controls);
+                    if (!compute_sample_controls(control_image,
+                                                 noised_input,
+                                                 timesteps_tensor,
+                                                 uncond,
+                                                 DiffusionExecutionBranch::NEGATIVE,
+                                                 &controls)) {
+                        return {};
+                    }
                 }
                 const std::vector<int>* uncond_skip_layers = nullptr;
                 if (is_skiplayer_step && slg_uncond) {
                     LOG_DEBUG("Skipping layers at uncond step %d\n", step);
                     uncond_skip_layers = &skip_layer_guidance.layers();
                 }
-                uncond_out = run_condition(uncond, nullptr, uncond_skip_layers);
+                uncond_out = run_condition(uncond,
+                                           DiffusionExecutionBranch::NEGATIVE,
+                                           nullptr,
+                                           uncond_skip_layers);
                 if (uncond_out.empty()) {
                     return {};
                 }
             }
             if (!img_cond.empty()) {
                 img_cond_out = run_condition(img_cond,
+                                             DiffusionExecutionBranch::AUXILIARY,
                                              cond.c_concat.empty() ? nullptr : &cond.c_concat);
                 if (img_cond_out.empty()) {
                     return {};
@@ -2169,6 +2539,7 @@ public:
                 if (!step_cache.is_step_skipped()) {
                     guidance_input.predict_skip_layer = [&]() -> sd::Tensor<float> {
                         return run_condition(cond,
+                                             DiffusionExecutionBranch::AUXILIARY,
                                              cond.c_concat.empty() ? nullptr : &cond.c_concat,
                                              &skip_layer_guidance.layers());
                     };
@@ -2197,13 +2568,21 @@ public:
                 preview_image(step, denoised, version, preview.mode, preview.callback, preview.data, false);
             }
             report_sample_progress(step, steps, t0);
+            if (sd_should_cancel()) {
+                LOG_WARN("sampling cancelled after step %d", step);
+                return {};
+            }
             output.pred = denoised;
             return output;
         };
 
         auto x0_opt = sample_k_diffusion(method, denoise, x_t, sigmas, sampler_rng, eta, is_flow_denoiser, extra_sample_args);
         if (x0_opt.empty()) {
-            LOG_ERROR("Diffusion model sampling failed");
+            if (sd_should_cancel()) {
+                LOG_WARN("Diffusion model sampling cancelled");
+            } else {
+                LOG_ERROR("Diffusion model sampling failed");
+            }
             if (control_net) {
                 control_net->free_control_ctx();
                 control_net->free_compute_buffer();
@@ -2384,6 +2763,26 @@ public:
             }
             flow_denoiser->set_shift(flow_shift);
         }
+    }
+
+    bool get_effective_flow_shift(float* flow_shift) const {
+        if (flow_shift == nullptr) {
+            return false;
+        }
+        auto flow_denoiser = std::dynamic_pointer_cast<DiscreteFlowDenoiser>(denoiser);
+        if (!flow_denoiser || !std::isfinite(flow_denoiser->shift)) {
+            return false;
+        }
+        *flow_shift = flow_denoiser->shift;
+        return true;
+    }
+
+    bool uses_dynamic_flow_shift() const {
+        return std::dynamic_pointer_cast<Flux2FlowDenoiser>(denoiser) != nullptr;
+    }
+
+    bool uses_distilled_guidance() const {
+        return distilled_guidance_input_enabled;
     }
 
     bool is_flow_denoiser() {
@@ -3056,6 +3455,54 @@ SD_API bool sd_ctx_supports_video_generation(const sd_ctx_t* sd_ctx) {
         return false;
     }
     return sd_version_supports_video_generation(sd_ctx->sd->version);
+}
+
+SD_API bool sd_ctx_uses_flow_shift(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return false;
+    }
+    float flow_shift = 0.0f;
+    return sd_ctx->sd->get_effective_flow_shift(&flow_shift);
+}
+
+SD_API bool sd_ctx_uses_dynamic_flow_shift(const sd_ctx_t* sd_ctx) {
+    return sd_ctx != nullptr && sd_ctx->sd != nullptr &&
+           sd_ctx->sd->uses_dynamic_flow_shift();
+}
+
+SD_API bool sd_ctx_uses_distilled_guidance(const sd_ctx_t* sd_ctx) {
+    return sd_ctx != nullptr && sd_ctx->sd != nullptr &&
+           sd_ctx->sd->uses_distilled_guidance();
+}
+
+SD_API bool sd_get_last_image_execution_evidence(const sd_ctx_t* sd_ctx,
+                                                  sd_image_execution_evidence_t* evidence) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || evidence == nullptr) {
+        return false;
+    }
+    const ImageExecutionEvidenceState& state = sd_ctx->sd->image_execution_evidence;
+    if (state.collecting || state.summary.version != ImageExecutionEvidenceState::VERSION) {
+        return false;
+    }
+    *evidence = state.summary;
+    return true;
+}
+
+SD_API bool sd_copy_last_image_conditioning_artifact(const sd_ctx_t* sd_ctx,
+                                                      uint8_t* destination,
+                                                      size_t destination_size) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || destination == nullptr) {
+        return false;
+    }
+    const ImageExecutionEvidenceState& state = sd_ctx->sd->image_execution_evidence;
+    if (state.collecting || state.summary.version != ImageExecutionEvidenceState::VERSION ||
+        destination_size != state.conditioning_artifact.size()) {
+        return false;
+    }
+    std::copy(state.conditioning_artifact.begin(),
+              state.conditioning_artifact.end(),
+              destination);
+    return true;
 }
 
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
@@ -4098,13 +4545,19 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     auto id_cond                     = sd_ctx->sd->get_pmid_conditon(request->pm_params, condition_params);
     int64_t prepare_start_ms         = ggml_time_ms();
     condition_params.zero_out_masked = false;
+    ConditioningExecutionEvidence positive_execution_evidence;
+    condition_params.execution_evidence = &positive_execution_evidence;
     auto cond                        = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                            condition_params);
+    sd_ctx->sd->image_execution_evidence.record_conditioning(
+        DiffusionExecutionBranch::POSITIVE,
+        positive_execution_evidence);
     if (cond.c_concat.empty()) {
         cond.c_concat = latents->concat_latent;  // TODO: optimize
     }
 
     SDCondition uncond;
+    ConditioningExecutionEvidence negative_execution_evidence;
     if (request->use_uncond || request->use_high_noise_uncond) {
         bool zero_out_masked = false;
         if (sd_version_is_sdxl(sd_ctx->sd->version) &&
@@ -4114,12 +4567,17 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         }
         condition_params.text            = request->negative_prompt;
         condition_params.zero_out_masked = zero_out_masked;
+        condition_params.execution_evidence = &negative_execution_evidence;
         uncond                           = sd_ctx->sd->cond_stage_model->get_learned_condition(sd_ctx->sd->n_threads,
                                                                                                condition_params);
         if (uncond.c_concat.empty()) {
             uncond.c_concat = latents->uncond_concat_latent;  // TODO: optimize
         }
     }
+    sd_ctx->sd->image_execution_evidence.record_conditioning(
+        DiffusionExecutionBranch::NEGATIVE,
+        negative_execution_evidence);
+    condition_params.execution_evidence = nullptr;
 
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
@@ -4364,6 +4822,11 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     if (sd_ctx == nullptr || sd_img_gen_params == nullptr) {
         return nullptr;
     }
+    ImageExecutionEvidenceScope image_execution_scope(sd_ctx->sd->image_execution_evidence);
+    VaeImageExecutionEvidenceScope vae_execution_scope(
+        sd_ctx->sd->first_stage_model,
+        sd_ctx->sd->preview_vae,
+        &sd_ctx->sd->image_execution_evidence.summary);
 
     int64_t t0                    = ggml_time_ms();
     sd_ctx->sd->vae_tiling_params = sd_img_gen_params->vae_tiling_params;
@@ -4382,6 +4845,10 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                         sd_img_gen_params,
                                                         &request,
                                                         &plan);
+    if (sd_should_cancel()) {
+        LOG_WARN("image generation cancelled after latent preparation");
+        return nullptr;
+    }
     if (!latents_opt.has_value()) {
         return nullptr;
     }
@@ -4392,6 +4859,10 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                       &request,
                                                       &plan,
                                                       &latents);
+    if (sd_should_cancel()) {
+        LOG_WARN("image generation cancelled after embedding preparation");
+        return nullptr;
+    }
     if (!embeds_opt.has_value()) {
         return nullptr;
     }
@@ -4403,6 +4874,10 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         int64_t sampling_start = ggml_time_ms();
         int64_t cur_seed       = request.seed + b;
         LOG_INFO("generating image: %i/%i - seed %" PRId64, b + 1, request.batch_count, cur_seed);
+        if (sd_should_cancel()) {
+            LOG_WARN("image generation cancelled before sampling batch %d", b + 1);
+            return nullptr;
+        }
 
         sd_ctx->sd->rng->manual_seed(cur_seed);
         sd_ctx->sd->sampler_rng->manual_seed(cur_seed);
@@ -4583,6 +5058,16 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
     }
 
     auto result = decode_image_outputs(sd_ctx, request, final_latents);
+    if (sd_should_cancel()) {
+        LOG_WARN("image generation cancelled after decode");
+        if (result != nullptr) {
+            for (int i = 0; i < request.batch_count; i++) {
+                free(result[i].data);
+            }
+            free(result);
+        }
+        return nullptr;
+    }
     if (result == nullptr) {
         return nullptr;
     }
@@ -4591,6 +5076,15 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
 
     int64_t t1 = ggml_time_ms();
     LOG_INFO("generate_image completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+    float effective_flow_shift = 0.0f;
+    const bool flow_shift_applied =
+        sd_ctx->sd->get_effective_flow_shift(&effective_flow_shift);
+    sd_ctx->sd->image_execution_evidence.mark_generation_completed(
+        flow_shift_applied,
+        sd_ctx->sd->uses_dynamic_flow_shift(),
+        effective_flow_shift,
+        sd_ctx->sd->uses_distilled_guidance(),
+        request.guidance.distilled_guidance);
     return result;
 }
 
